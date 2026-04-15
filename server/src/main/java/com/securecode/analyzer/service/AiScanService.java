@@ -10,7 +10,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
 
+import java.time.Duration;
 import java.util.*;
 
 @Service
@@ -21,27 +25,22 @@ public class AiScanService {
     @Value("${gemini.api.key}")
     private String apiKey;
 
-    private static final String GEMINI_MODEL = "gemini-3.1-flash-lite-preview";
+    private static final String GEMINI_MODEL = "gemini-3-flash-preview";
 
     private static final String PROMPT = """
-        You are a secure code analyzer.
+        You are a professional secure code analyzer.
+        Analyze the provided code and identify security vulnerabilities.
+        Return the results as a JSON array of objects.
+        
+        Each object must have:
+        - "type": (e.g., SQL Injection, XSS, Hardcoded Credentials)
+        - "lineNumber": (the integer line number)
+        - "severity": (one of: CRITICAL, HIGH, MEDIUM, LOW)
+        - "description": (concise explanation)
+        - "suggestedFix": (code or logic recommendation)
 
-        Analyze the given code and return ONLY a valid JSON array.
-
-        Format:
-        [
-          {
-            "type": "SQL Injection",
-            "lineNumber": 1,
-            "severity": "HIGH",
-            "description": "Explain the issue",
-            "suggestedFix": "Explain fix"
-          }
-        ]
-
-        Severity must be one of: CRITICAL, HIGH, MEDIUM, LOW.
-        If no issues found, return: []
-        ONLY return JSON. No markdown, no explanation.
+        If no issues are found, return an empty array [].
+        Do not include any conversational text or markdown formatting.
         """;
 
     private final WebClient webClient;
@@ -56,30 +55,42 @@ public class AiScanService {
 
     public List<Vulnerability> analyzeWithAi(String code) {
         try {
-            String fullPrompt = PROMPT + "\n\n" + code;
+            String fullPrompt = PROMPT + "\n\nCode to analyze:\n" + code;
 
             Map<String, Object> requestBody = Map.of(
                     "contents", List.of(
                             Map.of("parts", List.of(Map.of("text", fullPrompt)))
+                    ),
+                    "generationConfig", Map.of(
+                            "response_mime_type", "application/json"
                     )
             );
 
             String response = webClient.post()
-                    .uri("/v1beta/models/" + GEMINI_MODEL + ":generateContent?key=" + apiKey)
+                    .uri(uriBuilder -> uriBuilder
+                            .path("/v1beta/models/" + GEMINI_MODEL + ":generateContent")
+                            .queryParam("key", apiKey)
+                            .build())
                     .bodyValue(requestBody)
                     .retrieve()
+                    // Handle 503 specifically for the retry logic
+                    .onStatus(status -> status.value() == 503, clientResponse -> 
+                            Mono.error(new WebClientResponseException(503, "Service Unavailable", null, null, null)))
                     .bodyToMono(String.class)
+                    // RETRY LOGIC: Try 3 times, waiting 2s, 4s, 8s between attempts
+                    .retryWhen(Retry.backoff(3, Duration.ofSeconds(2))
+                            .filter(throwable -> throwable instanceof WebClientResponseException &&
+                                    ((WebClientResponseException) throwable).getStatusCode().value() == 503))
                     .block();
 
-            log.info("Gemini RAW RESPONSE: {}", response);
             return parseResponse(response);
 
         } catch (Exception e) {
-            log.error("Gemini API Error", e);
+            log.error("AI Scan failed after retries: {}", e.getMessage());
             return List.of(new Vulnerability(
-                    "AI_ERROR", 0,
-                    "AI service failed: " + e.getMessage(),
-                    "Verify Gemini API key in application.properties and check backend logs.",
+                    "AI_CONNECTION_ERROR", 0,
+                    "The AI service is currently unavailable or overloaded. Please try again in a moment.",
+                    "Check network connectivity or Gemini API quota.",
                     Severity.MEDIUM
             ));
         }
@@ -88,43 +99,33 @@ public class AiScanService {
     private List<Vulnerability> parseResponse(String responseJson) {
         try {
             JsonNode root = objectMapper.readTree(responseJson);
+            
+            // Navigate the Gemini response structure
             JsonNode candidates = root.path("candidates");
-
-            if (!candidates.isArray() || candidates.isEmpty()) {
-                throw new RuntimeException("No candidates in Gemini response");
+            if (candidates.isMissingNode() || candidates.isEmpty()) {
+                throw new RuntimeException("Gemini returned an empty response.");
             }
 
             String content = candidates.get(0)
                     .path("content").path("parts").get(0)
                     .path("text").asText();
 
-            content = content.replaceAll("(?s)^```json\\s*", "")
-                             .replaceAll("(?s)```\\s*$", "")
-                             .trim();
-
-            log.info("Cleaned AI Content: {}", content);
-
-            int start = content.indexOf("[");
-            int end   = content.lastIndexOf("]");
-            if (start == -1 || end == -1) {
-                throw new RuntimeException("No JSON array found in AI response");
-            }
-            content = content.substring(start, end + 1);
-
-            List<Map<String, Object>> rawList =
-                    objectMapper.readValue(content, new TypeReference<>() {});
+            log.info("AI returned JSON content: {}", content);
+            
+            List<Map<String, Object>> rawList = objectMapper.readValue(content, new TypeReference<>() {});
 
             List<Vulnerability> result = new ArrayList<>();
             for (Map<String, Object> item : rawList) {
                 Vulnerability v = new Vulnerability();
-                v.setType((String) item.getOrDefault("type", "Unknown"));
+                v.setType((String) item.getOrDefault("type", "Unknown Vulnerability"));
                 v.setLineNumber(((Number) item.getOrDefault("lineNumber", 0)).intValue());
-                v.setDescription((String) item.getOrDefault("description", ""));
-                v.setSuggestedFix((String) item.getOrDefault("suggestedFix", ""));
+                v.setDescription((String) item.getOrDefault("description", "No description provided."));
+                v.setSuggestedFix((String) item.getOrDefault("suggestedFix", "No fix suggested."));
+                
                 try {
-                    v.setSeverity(Severity.valueOf(
-                            ((String) item.getOrDefault("severity", "MEDIUM")).toUpperCase()));
-                } catch (Exception e) {
+                    String sevStr = ((String) item.getOrDefault("severity", "MEDIUM")).toUpperCase();
+                    v.setSeverity(Severity.valueOf(sevStr));
+                } catch (IllegalArgumentException e) {
                     v.setSeverity(Severity.MEDIUM);
                 }
                 result.add(v);
@@ -132,11 +133,11 @@ public class AiScanService {
             return result;
 
         } catch (Exception e) {
-            log.error("Parsing Failed", e);
+            log.error("Failed to parse AI response into Vulnerability objects", e);
             return List.of(new Vulnerability(
                     "PARSE_ERROR", 0,
-                    "Failed to parse AI response: " + e.getMessage(),
-                    "Ensure AI returns valid JSON array.",
+                    "AI response format was invalid: " + e.getMessage(),
+                    "Review the AI logs and ensure the model is returning valid JSON.",
                     Severity.MEDIUM
             ));
         }
