@@ -7,7 +7,7 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/api': {
-        target: process.env.VITE_API_URL || 'http://localhost:8080',
+        target: process.env.VITE_API_URL || 'https://devsecure-analyzer-1-0-0.onrender.com',
         changeOrigin: true,
       }
     }
